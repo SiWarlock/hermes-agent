@@ -135,6 +135,40 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
+def validate_repository_requirement(
+    *,
+    requires_repository: Optional[bool],
+    workspace_kind: str,
+    project_requested: bool,
+    project_resolved: bool,
+    task_ref: str = "",
+) -> None:
+    """Reject repository-required cards whose resolved workspace cannot provide one."""
+    if requires_repository is not None and type(requires_repository) is not bool:
+        raise ValueError(
+            "requires_repository must be true, false, or null, "
+            f"got {requires_repository!r}"
+        )
+    if requires_repository is not True:
+        return
+    if project_requested and not project_resolved:
+        raise ValueError(
+            f"requires_repository=true but project {task_ref} did not resolve, so no "
+            "repository could be anchored. Register the project (`hermes project list`) "
+            "or name the repository explicitly with --workspace "
+            "worktree:<absolute-repo-path>."
+        )
+    if workspace_kind == "scratch":
+        raise ValueError(
+            "requires_repository=true is incompatible with workspace_kind=scratch: a "
+            "scratch workspace is a fresh empty directory with no repository, so this "
+            "card cannot be worked. Use --workspace worktree (or "
+            "dir:<absolute-repo-path>), or pass --project <slug> to anchor it under the "
+            "project's repo. If this card genuinely needs no repository, set "
+            "requires_repository=false."
+        )
+
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
@@ -1141,6 +1175,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Explicit tri-state capability assertion. None means the creator did not
+    # specify whether repository access is required.
+    requires_repository: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1271,12 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            requires_repository=(
+                bool(row["requires_repository"])
+                if "requires_repository" in keys
+                and row["requires_repository"] is not None
+                else None
             ),
         )
 
@@ -1422,7 +1465,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Tri-state repository capability assertion: NULL = unspecified,
+    -- 0 = explicitly not required, 1 = explicitly required.
+    requires_repository INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2725,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "requires_repository" not in cols:
+        # Nullable with no default so legacy rows remain distinguishable from
+        # an explicit false assertion.
+        _add_column_if_missing(
+            conn, "tasks", "requires_repository", "requires_repository INTEGER"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3183,6 +3236,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    requires_repository: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3270,6 +3324,8 @@ def create_task(
     project_repo: Optional[str] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
+    project_requested = project_id is not None
+    project_ref = project_id or ""
     if project_id:
         from hermes_cli import projects_db as _pdb
 
@@ -3345,6 +3401,14 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    validate_repository_requirement(
+        requires_repository=requires_repository,
+        workspace_kind=workspace_kind,
+        project_requested=project_requested,
+        project_resolved=project_obj is not None,
+        task_ref=project_ref,
+    )
 
     parents = tuple(p for p in parents if p)
 
@@ -3497,8 +3561,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, requires_repository
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3588,11 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (
+                            1 if requires_repository is True
+                            else 0 if requires_repository is False
+                            else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3621,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "requires_repository": requires_repository,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -7370,7 +7440,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "requires_repository "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7385,6 +7456,11 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_requires_repository = (
+            bool(root_row["requires_repository"])
+            if root_row["requires_repository"] is not None
+            else None
+        )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7416,11 +7492,27 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_requires_repository = child.get("requires_repository")
+            if child_requires_repository is None:
+                child_requires_repository = root_requires_repository
+            if root_requires_repository is True and child_requires_repository is False:
+                raise ValueError(
+                    f"child[{idx}] sets requires_repository=false but root task "
+                    f"{task_id} requires a repository; a decomposition cannot drop "
+                    "its parent's repository requirement"
+                )
+            validate_repository_requirement(
+                requires_repository=child_requires_repository,
+                workspace_kind=child_ws_kind,
+                project_requested=False,
+                project_resolved=False,
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " requires_repository) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7431,6 +7523,11 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    (
+                        1 if child_requires_repository is True
+                        else 0 if child_requires_repository is False
+                        else None
+                    ),
                 ),
             )
             _append_event(
@@ -7884,6 +7981,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
         p.mkdir(parents=True, exist_ok=True)
+        if task.requires_repository is True and _git_toplevel(p) is None:
+            raise ValueError(
+                f"task {task.id} declares requires_repository=true but its resolved "
+                f"workspace {p.resolve(strict=False)} is not inside a git repository"
+            )
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
@@ -11050,6 +11152,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.requires_repository is not None:
+        lines.append(
+            f"Requires repository: {'yes' if task.requires_repository else 'no'}"
+        )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
